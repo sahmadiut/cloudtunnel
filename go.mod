@@ -1,6 +1,6 @@
 module github.com/sahmadiut/cloudtunnel
 
-go 1.24.12
+go 1.22
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0

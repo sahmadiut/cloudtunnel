@@ -2,6 +2,7 @@ package compression
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -87,7 +88,7 @@ func TestCompressedWriter(t *testing.T) {
 
 	result := make([]byte, len(data)*2) // Use larger buffer
 	n, err := r.Read(result)
-	if err != nil && err.Error() != "EOF" {
+	if err != nil && err != io.EOF {
 		t.Fatalf("read failed: %v", err)
 	}
 
