@@ -2,7 +2,6 @@
 package server
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -176,28 +175,21 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleHTTPPost handles POST requests (client -> server data)
 func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
-	// Read the body
-	reader := bufio.NewReader(r.Body)
-	defer r.Body.Close()
-
-	// First line should be CONNECT header
-	line, err := reader.ReadString('\n')
-	if err != nil {
+	// Get tunnel port from header
+	portStr := r.Header.Get("X-Tunnel-Port")
+	if portStr == "" {
 		h.log.Error().
-			Err(err).
-			Msg("failed to read connection header")
-		http.Error(w, "Bad request", http.StatusBadRequest)
+			Msg("missing X-Tunnel-Port header")
+		http.Error(w, "Missing X-Tunnel-Port header", http.StatusBadRequest)
 		return
 	}
 
-	// Parse CONNECT header
-	port, err := parseConnectHeader(line)
-	if err != nil {
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
 		h.log.Error().
-			Err(err).
-			Str("header", line).
-			Msg("invalid connection header")
-		http.Error(w, "Bad request", http.StatusBadRequest)
+			Str("port", portStr).
+			Msg("invalid port in X-Tunnel-Port header")
+		http.Error(w, "Invalid port", http.StatusBadRequest)
 		return
 	}
 
@@ -229,97 +221,70 @@ func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 
 	// Try to hijack the connection for persistent streaming
 	hijacker, ok := w.(http.Hijacker)
-	if ok {
-		// Hijack the connection for true bidirectional streaming
-		clientConn, buf, err := hijacker.Hijack()
-		if err != nil {
-			h.log.Error().
-				Err(err).
-				Msg("failed to hijack connection")
-			// Fall back to non-hijacked mode
-			h.handleHTTPPostNonHijacked(w, r, reader, target)
-			return
-		}
-		defer clientConn.Close()
-
-		// Send HTTP 200 response manually
-		if _, err := clientConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")); err != nil {
-			h.log.Error().
-				Err(err).
-				Msg("failed to write HTTP response")
-			return
-		}
-
-		h.log.Debug().
-			Int("port", port).
-			Str("remote_addr", r.RemoteAddr).
-			Msg("connection hijacked for persistent streaming")
-
-		// Bidirectional copy with proper stream handling
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// Client -> Target
-		go func() {
-			defer wg.Done()
-			
-			// First drain any remaining data from the original body reader
-			if reader.Buffered() > 0 {
-				if _, err := io.CopyN(target, reader, int64(reader.Buffered())); err != nil {
-					h.log.Debug().Err(err).Msg("error draining body reader")
-				}
-			}
-			
-			// Then drain any buffered data from the hijacker's buffer
-			if buf.Reader.Buffered() > 0 {
-				if _, err := io.CopyN(target, buf, int64(buf.Reader.Buffered())); err != nil {
-					h.log.Debug().Err(err).Msg("error draining hijack buffer")
-				}
-			}
-			
-			// Now read from the raw connection
-			io.Copy(target, clientConn)
-			
-			// Try to half-close the write side if it's a TCP connection
-			if tcpConn, ok := target.(*net.TCPConn); ok {
-				tcpConn.CloseWrite()
-			}
-		}()
-
-		// Target -> Client
-		go func() {
-			defer wg.Done()
-			io.Copy(clientConn, target)
-		}()
-
-		wg.Wait()
+	if !ok {
+		h.log.Error().Msg("server doesn't support connection hijacking")
+		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Fall back to non-hijacked mode
-	h.handleHTTPPostNonHijacked(w, r, reader, target)
-}
+	// Hijack the connection for true bidirectional streaming
+	clientConn, buf, err := hijacker.Hijack()
+	if err != nil {
+		h.log.Error().
+			Err(err).
+			Msg("failed to hijack connection")
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
 
-// handleHTTPPostNonHijacked handles POST without connection hijacking
-func (h *Handler) handleHTTPPostNonHijacked(w http.ResponseWriter, r *http.Request, reader *bufio.Reader, target net.Conn) {
-	// Copy remaining data to target
-	go func() {
-		io.Copy(target, reader)
-	}()
-
-	// Return response with data from target
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-
-	// Flush immediately
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	// Send HTTP 200 response manually
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")); err != nil {
+		h.log.Error().
+			Err(err).
+			Msg("failed to write HTTP response")
+		return
 	}
 
-	io.Copy(w, target)
+	h.log.Debug().
+		Int("port", port).
+		Str("remote_addr", r.RemoteAddr).
+		Msg("tunnel established")
+
+	// Bidirectional copy with proper stream handling
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client -> Target
+	go func() {
+		defer wg.Done()
+
+		// First drain any buffered data from the hijacker's buffer
+		if buf.Reader.Buffered() > 0 {
+			if _, err := io.CopyN(target, buf, int64(buf.Reader.Buffered())); err != nil {
+				h.log.Debug().Err(err).Msg("error draining hijack buffer")
+			}
+		}
+
+		// Now read from the raw connection
+		io.Copy(target, clientConn)
+
+		// Try to half-close the write side if it's a TCP connection
+		if tcpConn, ok := target.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
+	}()
+
+	// Target -> Client
+	go func() {
+		defer wg.Done()
+		io.Copy(clientConn, target)
+	}()
+
+	wg.Wait()
 }
 
-// handleHTTPGet handles GET requests (server -> client data)
+// handleHTTPGet handles GET requests (health check)
 func (h *Handler) handleHTTPGet(w http.ResponseWriter, r *http.Request) {
 	// For simple GET, just return OK to indicate server is alive
 	w.Header().Set("Content-Type", "application/octet-stream")

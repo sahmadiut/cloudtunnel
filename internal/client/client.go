@@ -109,7 +109,7 @@ func (c *Client) Start() error {
 	}, c.log)
 	c.checker.Start()
 	c.log.Debug().
-		Dur("interval", c.cfg.Resilience.HealthCheckInterval).
+		Str("interval", c.cfg.Resilience.HealthCheckInterval.String()).
 		Msg("health checker started")
 
 	c.log.Info().
@@ -158,6 +158,7 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 // Ping implements health.Pinger for health checking
+// It attempts to establish a tunnel connection to verify server is working
 func (c *Client) Ping(ctx context.Context) error {
 	// Create a simple HTTP GET request to check server health
 	scheme := "http"
@@ -168,14 +169,14 @@ func (c *Client) Ping(ctx context.Context) error {
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create health check request: %w", err)
 	}
 
 	if c.cfg.Security.AuthToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.cfg.Security.AuthToken)
 	}
 
-	// Create a simple client with custom dialer for resolve_ip support
+	// Create a client with custom dialer for resolve_ip support
 	dialer := &net.Dialer{
 		Timeout: c.cfg.Resilience.ConnectionTimeout,
 	}
@@ -200,12 +201,17 @@ func (c *Client) Ping(ctx context.Context) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("health check failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+	}
+
+	// Any 2xx response means server is alive
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("server returned error: HTTP %d", resp.StatusCode)
 	}
 
 	return nil

@@ -65,7 +65,7 @@ func NewHTTPTransport(cfg *config.Config) (*HTTPTransport, error) {
 	return t, nil
 }
 
-// Dial establishes a new HTTP tunnel connection with persistent streaming
+// Dial establishes a new HTTP tunnel connection
 func (t *HTTPTransport) Dial() (Conn, error) {
 	t.mu.Lock()
 	if t.closed {
@@ -120,17 +120,17 @@ func (t *HTTPTransport) Close() error {
 }
 
 // HTTPStreamConn implements a persistent streaming connection over HTTP
+// Uses HTTP CONNECT-style tunneling for bidirectional TCP streaming
 type HTTPStreamConn struct {
-	conn           net.Conn
-	cfg            *config.Config
-	host           string
-	reader         *bufio.Reader
-	mu             sync.Mutex
-	closed         bool
-	headerSent     bool
-	responseRead   bool
-	localAddr      net.Addr
-	remoteAddr     net.Addr
+	conn       net.Conn
+	cfg        *config.Config
+	host       string
+	reader     *bufio.Reader
+	mu         sync.Mutex
+	closed     bool
+	ready      bool // Connection is ready for bidirectional streaming
+	localAddr  net.Addr
+	remoteAddr net.Addr
 }
 
 // NewHTTPStreamConn creates a new HTTP streaming connection
@@ -145,17 +145,22 @@ func NewHTTPStreamConn(conn net.Conn, cfg *config.Config, host string) *HTTPStre
 	}
 }
 
-// sendHTTPHeader sends the initial HTTP POST request header
-func (c *HTTPStreamConn) sendHTTPHeader() error {
-	if c.headerSent {
+// setupTunnel sends the tunnel setup request and waits for confirmation
+func (c *HTTPStreamConn) setupTunnel(port int) error {
+	if c.ready {
 		return nil
 	}
 
-	// Build HTTP POST request
+	// Validate port
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid port: %d", port)
+	}
+
+	// Send HTTP POST request with tunnel port in header
 	req := fmt.Sprintf("POST /tunnel HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"Content-Type: application/octet-stream\r\n"+
-		"Connection: keep-alive\r\n", c.host)
+		"X-Tunnel-Port: %d\r\n", c.host, port)
 
 	// Add auth token if configured
 	if c.cfg.Security.AuthToken != "" {
@@ -164,16 +169,33 @@ func (c *HTTPStreamConn) sendHTTPHeader() error {
 
 	req += "\r\n"
 
-	_, err := c.conn.Write([]byte(req))
-	if err != nil {
-		return fmt.Errorf("failed to send HTTP header: %w", err)
+	// Send the request
+	if _, err := c.conn.Write([]byte(req)); err != nil {
+		return fmt.Errorf("failed to send tunnel request: %w", err)
 	}
 
-	c.headerSent = true
+	// Read and parse HTTP response
+	resp, err := http.ReadResponse(c.reader, nil)
+	if err != nil {
+		return fmt.Errorf("failed to read tunnel response: %w", err)
+	}
+
+	// Check for authentication errors
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tunnel setup failed: HTTP %d", resp.StatusCode)
+	}
+
+	c.ready = true
 	return nil
 }
 
 // Write writes data to the connection
+// First write must contain "CONNECT <port>\n" to establish the tunnel
+// This header is parsed locally and converted to HTTP X-Tunnel-Port header
 func (c *HTTPStreamConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -182,44 +204,26 @@ func (c *HTTPStreamConn) Write(p []byte) (int, error) {
 		return 0, errors.New("connection closed")
 	}
 
-	// Send HTTP header on first write
-	if err := c.sendHTTPHeader(); err != nil {
-		return 0, err
+	// If not ready, first data should be "CONNECT <port>\n"
+	if !c.ready {
+		// Parse the CONNECT header from the data to extract the port
+		port := 0
+		n, err := fmt.Sscanf(string(p), "CONNECT %d\n", &port)
+		if err != nil || n != 1 || port <= 0 {
+			return 0, fmt.Errorf("first write must be 'CONNECT <port>\\n', got: %s", string(p))
+		}
+
+		// Setup the tunnel with the specified port (sends HTTP request)
+		if err := c.setupTunnel(port); err != nil {
+			return 0, err
+		}
+
+		// The CONNECT header is consumed and converted to HTTP protocol
+		return len(p), nil
 	}
 
-	// Write tunnel data directly to the HTTP POST body stream
-	n, err := c.conn.Write(p)
-	if err != nil {
-		return n, err
-	}
-
-	return n, nil
-}
-
-// readHTTPResponse reads and validates the HTTP response headers
-func (c *HTTPStreamConn) readHTTPResponse() error {
-	if c.responseRead {
-		return nil
-	}
-
-	// Read HTTP response
-	resp, err := http.ReadResponse(c.reader, nil)
-	if err != nil {
-		return fmt.Errorf("failed to read HTTP response: %w", err)
-	}
-	
-	c.responseRead = true
-
-	// Check for authentication errors
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	return nil
+	// Write data directly to the connection
+	return c.conn.Write(p)
 }
 
 // Read reads data from the connection
@@ -231,14 +235,12 @@ func (c *HTTPStreamConn) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Read HTTP response header once after we've sent our request
-	if c.headerSent && !c.responseRead {
-		if err := c.readHTTPResponse(); err != nil {
-			return 0, err
-		}
+	// Must be ready before reading
+	if !c.ready {
+		return 0, errors.New("tunnel not ready: must write CONNECT header first")
 	}
 
-	// Read data directly from the connection (after response headers)
+	// Read data directly from the connection
 	return c.reader.Read(p)
 }
 
