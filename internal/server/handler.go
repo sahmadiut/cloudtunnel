@@ -243,7 +243,12 @@ func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 		defer clientConn.Close()
 
 		// Send HTTP 200 response manually
-		clientConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n"))
+		if _, err := clientConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")); err != nil {
+			h.log.Error().
+				Err(err).
+				Msg("failed to write HTTP response")
+			return
+		}
 
 		h.log.Debug().
 			Int("port", port).
@@ -259,10 +264,15 @@ func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			// First drain any buffered data from the reader
 			if buf.Reader.Buffered() > 0 {
-				io.CopyN(target, buf, int64(buf.Reader.Buffered()))
+				if _, err := io.CopyN(target, buf, int64(buf.Reader.Buffered())); err != nil {
+					h.log.Debug().Err(err).Msg("error draining buffered data")
+				}
 			}
 			io.Copy(target, clientConn)
-			target.(*net.TCPConn).CloseWrite()
+			// Try to half-close the write side if it's a TCP connection
+			if tcpConn, ok := target.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
 		}()
 
 		// Target -> Client
