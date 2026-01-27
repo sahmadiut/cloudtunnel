@@ -1,0 +1,43 @@
+mode: client
+
+# Server connection
+server:
+  address: "tunnel.example.com:443"
+  resolve_ip: ""  # Optional: bypass DNS/CDN
+
+# Port mappings (local -> remote)
+ports:
+  - local: 3306
+    remote: 3306
+  - local: 6379
+    remote: 6379
+  - local: 8080
+    remote: 8080
+
+# Transport settings
+transport:
+  protocol: http  # http | websocket
+  multiplex: true  # Single connection for all ports
+  packet_size: 4096  # Max bytes per HTTP request/response
+  compress: true  # Zstd compression
+  buffer_size: 65536  # Read/write buffer
+
+# TLS settings (optional)
+tls:
+  enabled: true
+  insecure_skip_verify: false  # For self-signed certs
+  ca_file: ""  # Custom CA certificate
+
+# Resilience settings
+resilience:
+  health_check_interval: 5s  # Ping interval
+  reconnect_min_delay: 1s  # Initial retry delay
+  reconnect_max_delay: 30s  # Max retry delay
+  connection_timeout: 10s  # Dial timeout
+  request_timeout: 30s  # HTTP request timeout
+
+# Logging
+logging:
+  level: info  # debug | info | warn | error
+  format: text  # text | json
+  file: ""  # Optional: log to file

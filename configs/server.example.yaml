@@ -1,0 +1,31 @@
+mode: server
+
+# Listen address
+listen:
+  address: "0.0.0.0:443"
+  path: "/tunnel"  # HTTP endpoint path
+
+# TLS settings (optional)
+tls:
+  enabled: true
+  cert_file: "/etc/cloudtunnel/cert.pem"
+  key_file: "/etc/cloudtunnel/key.pem"
+
+# Transport settings
+transport:
+  protocol: http
+  multiplex: true
+  packet_size: 4096
+  compress: true
+  buffer_size: 65536
+
+# Security
+security:
+  auth_token: "your-secret-token"  # Optional: bearer token auth
+  allowed_ports: [3306, 6379, 8080]  # Whitelist allowed ports
+
+# Logging
+logging:
+  level: info
+  format: json
+  file: "/var/log/cloudtunnel/server.log"
