@@ -173,6 +173,11 @@ func (c *HTTPConn) Read(p []byte) (int, error) {
 	}
 	defer resp.Body.Close()
 
+	// Check for authentication errors with clear logging
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return 0, fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -213,6 +218,11 @@ func (c *HTTPConn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
+
+	// Check for authentication errors with clear logging
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return 0, fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)

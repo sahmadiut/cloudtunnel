@@ -34,7 +34,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "invalid server address format",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address: "invalid",
 				},
 			},
@@ -44,7 +44,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "invalid resolve_ip",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address:   "localhost:8080",
 					ResolveIP: "invalid-ip",
 				},
@@ -55,7 +55,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "no port mappings",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address: "localhost:8080",
 				},
 				Ports: []PortMapping{},
@@ -66,7 +66,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "invalid local port",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address: "localhost:8080",
 				},
 				Ports: []PortMapping{
@@ -79,7 +79,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "invalid protocol",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address: "localhost:8080",
 				},
 				Ports: []PortMapping{
@@ -97,7 +97,7 @@ func TestValidateClientConfig(t *testing.T) {
 			name: "valid client config",
 			cfg: &Config{
 				Mode: "client",
-				Server: ServerConfig{
+				Server: ServerConnConfig{
 					Address: "localhost:8080",
 				},
 				Ports: []PortMapping{

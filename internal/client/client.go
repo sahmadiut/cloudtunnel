@@ -88,6 +88,27 @@ func (c *Client) Start() error {
 		return fmt.Errorf("failed to start port forwarder: %w", err)
 	}
 
+	// Initialize and start health checker
+	c.checker = health.NewChecker(c, health.CheckerConfig{
+		Interval: c.cfg.Resilience.HealthCheckInterval,
+		Timeout:  c.cfg.Resilience.ConnectionTimeout,
+		OnUnhealthy: func() {
+			c.log.Warn().Msg("server connection unhealthy, attempting reconnection")
+			c.reconnect.ReconnectAsync(func(err error) {
+				if err != nil {
+					c.log.Error().Err(err).Msg("reconnection failed")
+				}
+			})
+		},
+		OnRecovered: func() {
+			c.log.Info().Msg("server connection recovered")
+		},
+	}, c.log)
+	c.checker.Start()
+	c.log.Debug().
+		Dur("interval", c.cfg.Resilience.HealthCheckInterval).
+		Msg("health checker started")
+
 	c.log.Info().
 		Int("ports", len(c.cfg.Ports)).
 		Msg("tunnel client started")
@@ -100,6 +121,10 @@ func (c *Client) Stop() {
 	c.log.Info().Msg("stopping tunnel client")
 
 	c.cancel()
+
+	if c.checker != nil {
+		c.checker.Stop()
+	}
 
 	if c.forwarder != nil {
 		c.forwarder.Stop()

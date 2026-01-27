@@ -227,6 +227,60 @@ func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 		Str("remote_addr", r.RemoteAddr).
 		Msg("connected to target via HTTP")
 
+	// Try to hijack the connection for persistent streaming
+	hijacker, ok := w.(http.Hijacker)
+	if ok {
+		// Hijack the connection for true bidirectional streaming
+		clientConn, buf, err := hijacker.Hijack()
+		if err != nil {
+			h.log.Error().
+				Err(err).
+				Msg("failed to hijack connection")
+			// Fall back to non-hijacked mode
+			h.handleHTTPPostNonHijacked(w, r, reader, target)
+			return
+		}
+		defer clientConn.Close()
+
+		// Send HTTP 200 response manually
+		clientConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n"))
+
+		h.log.Debug().
+			Int("port", port).
+			Str("remote_addr", r.RemoteAddr).
+			Msg("connection hijacked for persistent streaming")
+
+		// Bidirectional copy with proper stream handling
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Client -> Target (drain buffered data first, then read from connection)
+		go func() {
+			defer wg.Done()
+			// First drain any buffered data from the reader
+			if buf.Reader.Buffered() > 0 {
+				io.CopyN(target, buf, int64(buf.Reader.Buffered()))
+			}
+			io.Copy(target, clientConn)
+			target.(*net.TCPConn).CloseWrite()
+		}()
+
+		// Target -> Client
+		go func() {
+			defer wg.Done()
+			io.Copy(clientConn, target)
+		}()
+
+		wg.Wait()
+		return
+	}
+
+	// Fall back to non-hijacked mode
+	h.handleHTTPPostNonHijacked(w, r, reader, target)
+}
+
+// handleHTTPPostNonHijacked handles POST without connection hijacking
+func (h *Handler) handleHTTPPostNonHijacked(w http.ResponseWriter, r *http.Request, reader *bufio.Reader, target net.Conn) {
 	// Copy remaining data to target
 	go func() {
 		io.Copy(target, reader)
