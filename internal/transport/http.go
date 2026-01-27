@@ -2,7 +2,7 @@
 package transport
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -19,7 +19,6 @@ import (
 // HTTPTransport implements Transport using HTTP/HTTPS
 type HTTPTransport struct {
 	cfg        *config.Config
-	client     *http.Client
 	serverURL  string
 	dialer     *net.Dialer
 	tlsConfig  *tls.Config
@@ -27,6 +26,7 @@ type HTTPTransport struct {
 	closed     bool
 	resolveIP  string
 	targetHost string
+	serverAddr string
 }
 
 // NewHTTPTransport creates a new HTTP transport
@@ -52,6 +52,7 @@ func NewHTTPTransport(cfg *config.Config) (*HTTPTransport, error) {
 	t := &HTTPTransport{
 		cfg:        cfg,
 		serverURL:  serverURL,
+		serverAddr: cfg.Server.Address,
 		resolveIP:  cfg.Server.ResolveIP,
 		targetHost: host,
 		dialer: &net.Dialer{
@@ -61,38 +62,10 @@ func NewHTTPTransport(cfg *config.Config) (*HTTPTransport, error) {
 		tlsConfig: tlsConfig,
 	}
 
-	// Create HTTP client with custom dialer
-	transport := &http.Transport{
-		DialContext:         t.dialContext,
-		TLSClientConfig:     tlsConfig,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-	}
-
-	t.client = &http.Client{
-		Transport: transport,
-		Timeout:   cfg.Resilience.RequestTimeout,
-	}
-
 	return t, nil
 }
 
-// dialContext is a custom dial function that supports resolve_ip
-func (t *HTTPTransport) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	// If resolve_ip is set, connect to the specified IP instead of resolving
-	if t.resolveIP != "" {
-		_, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		addr = net.JoinHostPort(t.resolveIP, port)
-	}
-
-	return t.dialer.DialContext(ctx, network, addr)
-}
-
-// Dial establishes a new HTTP tunnel connection
+// Dial establishes a new HTTP tunnel connection with persistent streaming
 func (t *HTTPTransport) Dial() (Conn, error) {
 	t.mu.Lock()
 	if t.closed {
@@ -101,7 +74,36 @@ func (t *HTTPTransport) Dial() (Conn, error) {
 	}
 	t.mu.Unlock()
 
-	return NewHTTPConn(t.client, t.serverURL, t.cfg), nil
+	// Determine the address to connect to
+	addr := t.serverAddr
+	if t.resolveIP != "" {
+		_, port, err := net.SplitHostPort(t.serverAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse server address: %w", err)
+		}
+		addr = net.JoinHostPort(t.resolveIP, port)
+	}
+
+	// Establish raw TCP connection
+	ctx, cancel := context.WithTimeout(context.Background(), t.cfg.Resilience.ConnectionTimeout)
+	defer cancel()
+
+	conn, err := t.dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to server: %w", err)
+	}
+
+	// Upgrade to TLS if enabled
+	if t.cfg.TLS.Enabled {
+		tlsConn := tls.Client(conn, t.tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		conn = tlsConn
+	}
+
+	return NewHTTPStreamConn(conn, t.cfg, t.targetHost), nil
 }
 
 // Close closes the transport
@@ -114,85 +116,65 @@ func (t *HTTPTransport) Close() error {
 	}
 
 	t.closed = true
-	t.client.CloseIdleConnections()
 	return nil
 }
 
-// HTTPConn implements Conn over HTTP
-type HTTPConn struct {
-	client     *http.Client
-	serverURL  string
-	cfg        *config.Config
-	readBuf    bytes.Buffer
-	writeBuf   bytes.Buffer
-	mu         sync.Mutex
-	closed     bool
-	localAddr  net.Addr
-	remoteAddr net.Addr
+// HTTPStreamConn implements a persistent streaming connection over HTTP
+type HTTPStreamConn struct {
+	conn           net.Conn
+	cfg            *config.Config
+	host           string
+	reader         *bufio.Reader
+	mu             sync.Mutex
+	closed         bool
+	headerSent     bool
+	responseRead   bool
+	localAddr      net.Addr
+	remoteAddr     net.Addr
 }
 
-// NewHTTPConn creates a new HTTP connection
-func NewHTTPConn(client *http.Client, serverURL string, cfg *config.Config) *HTTPConn {
-	return &HTTPConn{
-		client:     client,
-		serverURL:  serverURL,
+// NewHTTPStreamConn creates a new HTTP streaming connection
+func NewHTTPStreamConn(conn net.Conn, cfg *config.Config, host string) *HTTPStreamConn {
+	return &HTTPStreamConn{
+		conn:       conn,
 		cfg:        cfg,
-		localAddr:  NewAddr("tcp", "local"),
-		remoteAddr: NewAddr("tcp", serverURL),
+		host:       host,
+		reader:     bufio.NewReader(conn),
+		localAddr:  conn.LocalAddr(),
+		remoteAddr: conn.RemoteAddr(),
 	}
 }
 
-// Read reads data from the HTTP connection
-func (c *HTTPConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
-		return 0, io.EOF
+// sendHTTPHeader sends the initial HTTP POST request header
+func (c *HTTPStreamConn) sendHTTPHeader() error {
+	if c.headerSent {
+		return nil
 	}
 
-	// If we have buffered data, return it
-	if c.readBuf.Len() > 0 {
-		return c.readBuf.Read(p)
-	}
-
-	// Make a GET request to receive data
-	req, err := http.NewRequest("GET", c.serverURL, nil)
-	if err != nil {
-		return 0, err
-	}
+	// Build HTTP POST request
+	req := fmt.Sprintf("POST /tunnel HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Content-Type: application/octet-stream\r\n"+
+		"Connection: keep-alive\r\n", c.host)
 
 	// Add auth token if configured
 	if c.cfg.Security.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.Security.AuthToken)
+		req += fmt.Sprintf("Authorization: Bearer %s\r\n", c.cfg.Security.AuthToken)
 	}
 
-	resp, err := c.client.Do(req)
+	req += "\r\n"
+
+	_, err := c.conn.Write([]byte(req))
 	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	// Check for authentication errors with clear logging
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return 0, fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+		return fmt.Errorf("failed to send HTTP header: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-
-	// Read response body into buffer
-	_, err = io.Copy(&c.readBuf, resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	return c.readBuf.Read(p)
+	c.headerSent = true
+	return nil
 }
 
-// Write writes data to the HTTP connection
-func (c *HTTPConn) Write(p []byte) (int, error) {
+// Write writes data to the connection
+func (c *HTTPStreamConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -200,67 +182,100 @@ func (c *HTTPConn) Write(p []byte) (int, error) {
 		return 0, errors.New("connection closed")
 	}
 
-	// Make a POST request to send data
-	req, err := http.NewRequest("POST", c.serverURL, bytes.NewReader(p))
-	if err != nil {
+	// Send HTTP header on first write
+	if err := c.sendHTTPHeader(); err != nil {
 		return 0, err
 	}
 
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	// Add auth token if configured
-	if c.cfg.Security.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.Security.AuthToken)
-	}
-
-	resp, err := c.client.Do(req)
+	// Write tunnel data directly to the HTTP POST body stream
+	n, err := c.conn.Write(p)
 	if err != nil {
-		return 0, err
+		return n, err
 	}
-	defer resp.Body.Close()
 
-	// Check for authentication errors with clear logging
+	return n, nil
+}
+
+// readHTTPResponse reads and validates the HTTP response headers
+func (c *HTTPStreamConn) readHTTPResponse() error {
+	if c.responseRead {
+		return nil
+	}
+
+	// Read HTTP response
+	resp, err := http.ReadResponse(c.reader, nil)
+	if err != nil {
+		return fmt.Errorf("failed to read HTTP response: %w", err)
+	}
+	
+	c.responseRead = true
+
+	// Check for authentication errors
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return 0, fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+		return fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	return len(p), nil
-}
-
-// Close closes the HTTP connection
-func (c *HTTPConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.closed = true
 	return nil
 }
 
+// Read reads data from the connection
+func (c *HTTPStreamConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return 0, io.EOF
+	}
+
+	// Read HTTP response header once after we've sent our request
+	if c.headerSent && !c.responseRead {
+		if err := c.readHTTPResponse(); err != nil {
+			return 0, err
+		}
+	}
+
+	// Read data directly from the connection (after response headers)
+	return c.reader.Read(p)
+}
+
+// Close closes the connection
+func (c *HTTPStreamConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return nil
+	}
+
+	c.closed = true
+	return c.conn.Close()
+}
+
 // LocalAddr returns the local network address
-func (c *HTTPConn) LocalAddr() net.Addr {
+func (c *HTTPStreamConn) LocalAddr() net.Addr {
 	return c.localAddr
 }
 
 // RemoteAddr returns the remote network address
-func (c *HTTPConn) RemoteAddr() net.Addr {
+func (c *HTTPStreamConn) RemoteAddr() net.Addr {
 	return c.remoteAddr
 }
 
 // SetDeadline sets the read and write deadlines
-func (c *HTTPConn) SetDeadline(t time.Time) error {
-	return nil // HTTP doesn't support per-connection deadlines directly
+func (c *HTTPStreamConn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
 }
 
 // SetReadDeadline sets the read deadline
-func (c *HTTPConn) SetReadDeadline(t time.Time) error {
-	return nil
+func (c *HTTPStreamConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
 }
 
 // SetWriteDeadline sets the write deadline
-func (c *HTTPConn) SetWriteDeadline(t time.Time) error {
-	return nil
+func (c *HTTPStreamConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
 }

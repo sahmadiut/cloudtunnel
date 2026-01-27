@@ -145,9 +145,10 @@ func (c *Checker) check() {
 
 	if err != nil {
 		c.consecutiveFails++
-		c.log.Debug().
+		c.log.Warn().
 			Err(err).
 			Int("consecutive_fails", c.consecutiveFails).
+			Str("status", c.status.String()).
 			Msg("health check failed")
 
 		if c.consecutiveFails >= 3 {
@@ -159,6 +160,10 @@ func (c *Checker) check() {
 		wasUnhealthy := c.status == StatusUnhealthy
 		c.consecutiveFails = 0
 		c.status = StatusHealthy
+
+		c.log.Debug().
+			Str("status", c.status.String()).
+			Msg("health check passed")
 
 		if wasUnhealthy && c.onRecovered != nil {
 			c.mu.Unlock()

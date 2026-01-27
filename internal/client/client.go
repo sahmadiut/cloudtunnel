@@ -3,7 +3,10 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
+	"net/http"
 	"sync"
 
 	"github.com/sahmadiut/cloudtunnel/internal/config"
@@ -156,7 +159,56 @@ func (c *Client) connect(ctx context.Context) error {
 
 // Ping implements health.Pinger for health checking
 func (c *Client) Ping(ctx context.Context) error {
-	return c.connect(ctx)
+	// Create a simple HTTP GET request to check server health
+	scheme := "http"
+	if c.cfg.TLS.Enabled {
+		scheme = "https"
+	}
+	url := fmt.Sprintf("%s://%s/tunnel", scheme, c.cfg.Server.Address)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	if c.cfg.Security.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.Security.AuthToken)
+	}
+
+	// Create a simple client with custom dialer for resolve_ip support
+	dialer := &net.Dialer{
+		Timeout: c.cfg.Resilience.ConnectionTimeout,
+	}
+	client := &http.Client{
+		Timeout: c.cfg.Resilience.ConnectionTimeout,
+		Transport: &http.Transport{
+			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+				if c.cfg.Server.ResolveIP != "" {
+					_, port, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, err
+					}
+					addr = net.JoinHostPort(c.cfg.Server.ResolveIP, port)
+				}
+				return dialer.DialContext(dialCtx, network, addr)
+			},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: c.cfg.TLS.InsecureSkipVerify,
+			},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("authentication failed: invalid token (HTTP %d)", resp.StatusCode)
+	}
+
+	return nil
 }
 
 // Wait blocks until the client is stopped

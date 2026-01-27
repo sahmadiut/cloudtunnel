@@ -259,16 +259,27 @@ func (h *Handler) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		// Client -> Target (drain buffered data first, then read from connection)
+		// Client -> Target
 		go func() {
 			defer wg.Done()
-			// First drain any buffered data from the reader
-			if buf.Reader.Buffered() > 0 {
-				if _, err := io.CopyN(target, buf, int64(buf.Reader.Buffered())); err != nil {
-					h.log.Debug().Err(err).Msg("error draining buffered data")
+			
+			// First drain any remaining data from the original body reader
+			if reader.Buffered() > 0 {
+				if _, err := io.CopyN(target, reader, int64(reader.Buffered())); err != nil {
+					h.log.Debug().Err(err).Msg("error draining body reader")
 				}
 			}
+			
+			// Then drain any buffered data from the hijacker's buffer
+			if buf.Reader.Buffered() > 0 {
+				if _, err := io.CopyN(target, buf, int64(buf.Reader.Buffered())); err != nil {
+					h.log.Debug().Err(err).Msg("error draining hijack buffer")
+				}
+			}
+			
+			// Now read from the raw connection
 			io.Copy(target, clientConn)
+			
 			// Try to half-close the write side if it's a TCP connection
 			if tcpConn, ok := target.(*net.TCPConn); ok {
 				tcpConn.CloseWrite()
